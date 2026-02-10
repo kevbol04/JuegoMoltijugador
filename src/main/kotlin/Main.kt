@@ -1,12 +1,14 @@
+import com.kevin.multijugador.client.ClientMain
 import com.kevin.multijugador.server.ServerMain
 
 fun main() {
     println("1) Iniciar servidor")
-    println("2) (Luego) Iniciar cliente")
+    println("2) Iniciar cliente")
     print("Elige opción: ")
 
-    when (readLine()?.trim()) {
+    when (readlnOrNull()?.trim()) {
         "1" -> ServerMain.main(emptyArray())
-        else -> println("De momento solo está implementado el servidor")
+        "2" -> ClientMain.main(emptyArray())
+        else -> println("Opción no válida")
     }
 }
