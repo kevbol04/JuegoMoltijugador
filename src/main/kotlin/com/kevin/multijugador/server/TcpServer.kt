@@ -11,7 +11,7 @@ class TcpServer(
 ) {
     private val clientCount = AtomicInteger(0)
     private val queue = MatchmakingQueue()
-    private val gameService = ServerGameService()
+    private val gameService = ServerGameService(recordsStore)
 
     suspend fun start() = coroutineScope {
         val serverSocket = ServerSocket(config.port)

@@ -19,6 +19,7 @@ object ClientMain {
         val mySymbol = AtomicReference<String?>(null)
         val lastState = AtomicReference<String?>(null)
         val clientState = AtomicReference(ClientState.MENU)
+        val usernameRef = AtomicReference<String?>(null)
 
         try {
             client.connect()
@@ -38,6 +39,7 @@ object ClientMain {
                 when (env.type) {
                     MessageType.LOGIN_OK -> {
                         println("Sesión iniciada como $username")
+                        usernameRef.set(username.lowercase())
                         break
                     }
                     MessageType.LOGIN_ERROR -> {
@@ -48,7 +50,6 @@ object ClientMain {
                 }
             }
 
-            // ===== RECORDS SYNC =====
             while (true) {
                 val line = client.readBlockingLine()
                 val env = JsonCodec.decode(line) ?: continue
@@ -79,7 +80,7 @@ object ClientMain {
                             val sym = extractString(env.payloadJson, "yourSymbol")
                             mySymbol.set(sym)
                             clientState.set(ClientState.IN_GAME)
-                            println("\n🎮 Partida iniciada. Tu símbolo: $sym")
+                            println("\nPartida iniciada. Tu símbolo: $sym")
                         }
 
                         MessageType.GAME_STATE -> {
@@ -96,19 +97,49 @@ object ClientMain {
 
                         MessageType.ROUND_END -> {
                             val winner = extractString(env.payloadJson, "winner")
+                            val winnerUser = extractString(env.payloadJson, "winnerUser")
+                            val loserUser = extractString(env.payloadJson, "loserUser")
+
+                            val mineUser = usernameRef.get()
+
                             when (winner) {
                                 "DRAW" -> println("\n🤝 Empate.")
-                                "X", "O" -> println("\n🏆 Ganador: $winner")
+                                "X", "O" -> {
+                                    if (winnerUser != null) {
+                                        println("\n🏆 Ganador: $winner ($winnerUser)")
+                                    } else {
+                                        println("\n🏆 Ganador: $winner")
+                                    }
+
+                                    if (mineUser != null && winnerUser != null && loserUser != null) {
+                                        if (mineUser == winnerUser.lowercase()) {
+                                            println("✅ Has ganado contra $loserUser")
+                                        } else if (mineUser == loserUser.lowercase()) {
+                                            println("❌ Has perdido contra $winnerUser")
+                                        }
+                                    }
+                                }
                                 else -> println("\nFin de ronda.")
                             }
+
                             mySymbol.set(null)
                             lastState.set(null)
                             clientState.set(ClientState.MENU)
                         }
 
                         MessageType.ERROR -> {
-                            val msg = extractString(env.payloadJson, "message")
-                            println("ERROR: $msg")
+                            val msg = extractString(env.payloadJson, "message") ?: "Error desconocido"
+                            println("\nERROR: $msg")
+
+                            val mine = mySymbol.get()
+                            val stateJson = lastState.get()
+                            val next = if (stateJson != null) extractString(stateJson, "nextPlayer") else null
+
+                            if (clientState.get() == ClientState.IN_GAME && mine != null && next == mine) {
+                                println("Repite la tirada.")
+                                val (r, c) = askMove()
+                                client.send(MessageType.MAKE_MOVE, """{"row":$r,"col":$c}""")
+                            }
                         }
                     }
                 }
@@ -134,10 +165,11 @@ object ClientMain {
                         clientState.set(ClientState.QUEUE)
                     }
                     "3" -> {
-                        println("\n--- RECORDS ---")
-                        println(client.recordsJson)
+                        println("\n===== RECORDS =====")
+                        printFormattedRecords(client.recordsJson)
                         println()
                     }
+
                     "5" -> {
                         println("Saliendo...")
                         client.close()
@@ -160,8 +192,16 @@ object ClientMain {
             val r = readLine()?.trim()?.toIntOrNull()
             print("Col  (0-2): ")
             val c = readLine()?.trim()?.toIntOrNull()
-            if (r != null && c != null && r in 0..2 && c in 0..2) return r to c
-            println("Entrada inválida.")
+
+            if (r == null || c == null) {
+                println("Debes escribir números.")
+                continue
+            }
+            if (r !in 0..2 || c !in 0..2) {
+                println("Fuera de rango. Debe ser entre 0 y 2.")
+                continue
+            }
+            return r to c
         }
     }
 
@@ -180,6 +220,50 @@ object ClientMain {
         }
         println("Turno: $next")
     }
+
+    private fun printFormattedRecords(json: String) {
+
+        val playersSection = """"players"\s*:\s*\{(.*)\}""".toRegex()
+            .find(json)?.groupValues?.getOrNull(1)
+            ?: run {
+                println("No hay estadísticas aún.")
+                return
+            }
+
+        val playerRegex = """"([^"]+)"\s*:\s*\{([^}]*)\}""".toRegex()
+
+        val players = playerRegex.findAll(playersSection).toList()
+
+        if (players.isEmpty()) {
+            println("No hay estadísticas aún.")
+            return
+        }
+
+        for (match in players) {
+            val username = match.groupValues[1]
+            val stats = match.groupValues[2]
+
+            val wins = extractStat(stats, "wins")
+            val losses = extractStat(stats, "losses")
+            val draws = extractStat(stats, "draws")
+            val streak = extractStat(stats, "streak")
+            val bestStreak = extractStat(stats, "bestStreak")
+
+            println("Usuario: $username")
+            println("   🏆 Victorias: $wins")
+            println("   ❌ Derrotas: $losses")
+            println("   🤝 Empates: $draws")
+            println("   🔥 Racha actual: $streak")
+            println("   ⭐ Mejor racha: $bestStreak")
+            println("---------------------------------")
+        }
+    }
+
+    private fun extractStat(stats: String, field: String): Int {
+        val regex = """"$field"\s*:\s*(\d+)""".toRegex()
+        return regex.find(stats)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+    }
+
 
     private fun cell(board: List<List<String>>, r: Int, c: Int): String {
         val v = board.getOrNull(r)?.getOrNull(c) ?: ""

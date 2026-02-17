@@ -4,7 +4,9 @@ import com.kevin.multijugador.protocol.MessageType
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
-class ServerGameService {
+class ServerGameService(
+    private val recordsStore: RecordsStore
+) {
     private val sessionsByClient = ConcurrentHashMap<ClientConnection, GameSession>()
 
     fun startPvpGame(a: ClientConnection, b: ClientConnection) {
@@ -55,6 +57,7 @@ class ServerGameService {
 
         if (winner != null) {
             broadcastState(session)
+            applyResultToRecords(session, winner)
             broadcastRoundEnd(session, winner)
             endSession(session)
             return
@@ -62,6 +65,7 @@ class ServerGameService {
 
         if (draw) {
             broadcastState(session)
+            applyDrawToRecords(session)
             broadcastRoundEnd(session, "DRAW")
             endSession(session)
             return
@@ -70,10 +74,28 @@ class ServerGameService {
         broadcastState(session)
     }
 
+    private fun applyResultToRecords(session: GameSession, winner: String) {
+        val xUser = session.playerX.username ?: return
+        val oUser = session.playerO.username ?: return
+
+        if (winner == "X") {
+            recordsStore.updateResult(xUser, RecordsStore.Outcome.WIN)
+            recordsStore.updateResult(oUser, RecordsStore.Outcome.LOSS)
+        } else if (winner == "O") {
+            recordsStore.updateResult(oUser, RecordsStore.Outcome.WIN)
+            recordsStore.updateResult(xUser, RecordsStore.Outcome.LOSS)
+        }
+    }
+
+    private fun applyDrawToRecords(session: GameSession) {
+        val xUser = session.playerX.username ?: return
+        val oUser = session.playerO.username ?: return
+        recordsStore.updateResult(xUser, RecordsStore.Outcome.DRAW)
+        recordsStore.updateResult(oUser, RecordsStore.Outcome.DRAW)
+    }
+
     private fun broadcastState(session: GameSession) {
-        val boardJson = session.board.joinToString(
-            prefix = "[", postfix = "]"
-        ) { row ->
+        val boardJson = session.board.joinToString(prefix = "[", postfix = "]") { row ->
             row.joinToString(prefix = "[", postfix = "]") { cell ->
                 """"${if (cell == ' ') "" else cell.toString()}""""
             }
@@ -85,11 +107,16 @@ class ServerGameService {
     }
 
     private fun broadcastRoundEnd(session: GameSession, winner: String) {
-        val payload = if (winner == "DRAW") {
-            """{"gameId":"${session.id}","winner":"DRAW"}"""
-        } else {
-            """{"gameId":"${session.id}","winner":"$winner"}"""
+        val xUser = session.playerX.username ?: "PlayerX"
+        val oUser = session.playerO.username ?: "PlayerO"
+
+        val payload = when (winner) {
+            "DRAW" -> """{"gameId":"${session.id}","winner":"DRAW","winnerUser":null,"loserUser":null}"""
+            "X" -> """{"gameId":"${session.id}","winner":"X","winnerUser":"$xUser","loserUser":"$oUser"}"""
+            "O" -> """{"gameId":"${session.id}","winner":"O","winnerUser":"$oUser","loserUser":"$xUser"}"""
+            else -> """{"gameId":"${session.id}","winner":"$winner","winnerUser":null,"loserUser":null}"""
         }
+
         session.playerX.send(MessageType.ROUND_END, payload)
         session.playerO.send(MessageType.ROUND_END, payload)
     }
@@ -104,7 +131,6 @@ class ServerGameService {
 
     private fun checkWinner(b: Array<CharArray>): String? {
         val lines = mutableListOf<List<Char>>()
-
         for (r in 0..2) lines.add(listOf(b[r][0], b[r][1], b[r][2]))
         for (c in 0..2) lines.add(listOf(b[0][c], b[1][c], b[2][c]))
         lines.add(listOf(b[0][0], b[1][1], b[2][2]))
