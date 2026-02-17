@@ -3,7 +3,6 @@ package com.kevin.multijugador.server
 import com.kevin.multijugador.util.ServerConfig
 import kotlinx.coroutines.*
 import java.net.ServerSocket
-import java.net.Socket
 import java.util.concurrent.atomic.AtomicInteger
 
 class TcpServer(
@@ -11,6 +10,8 @@ class TcpServer(
     private val recordsStore: RecordsStore
 ) {
     private val clientCount = AtomicInteger(0)
+    private val queue = MatchmakingQueue()
+    private val gameService = ServerGameService()
 
     suspend fun start() = coroutineScope {
         val serverSocket = ServerSocket(config.port)
@@ -29,7 +30,7 @@ class TcpServer(
 
             launch(Dispatchers.IO) {
                 try {
-                    ClientHandler(socket, recordsStore).run()
+                    ClientHandler(socket, recordsStore, queue, gameService).run()
                 } finally {
                     clientCount.decrementAndGet()
                 }

@@ -1,2 +1,6 @@
-package org.example.com.kevin.multijugador.protocol
+package com.kevin.multijugador.protocol
 
+data class Envelope(
+    val type: String,
+    val payloadJson: String
+)

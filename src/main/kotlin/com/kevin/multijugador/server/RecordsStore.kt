@@ -15,8 +15,13 @@ class RecordsStore(
             Files.createDirectories(filePath.parent)
             Files.writeString(filePath, """{"players":{}}""")
         }
+
         return Files.readString(filePath)
+            .replace("\r", "")
+            .replace("\n", "")
+            .trim()
     }
+
 
     fun saveRawJson(json: String) = lock.withLock {
         Files.writeString(filePath, json)
