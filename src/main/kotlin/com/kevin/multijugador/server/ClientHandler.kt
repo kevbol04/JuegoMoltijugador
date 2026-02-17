@@ -23,19 +23,46 @@ class ClientHandler(
         println("Cliente conectado: ${socket.inetAddress.hostAddress}")
 
         try {
+            while (true) {
+                val firstLine = reader.readLine() ?: return
+                val firstEnv = JsonCodec.decode(firstLine)
+
+                if (firstEnv == null || firstEnv.type != MessageType.LOGIN) {
+                    conn.send(MessageType.LOGIN_ERROR, """{"message":"Debes enviar LOGIN primero"}""")
+                    continue
+                }
+
+                val rawUsername = extractString(firstEnv.payloadJson, "username")?.trim().orEmpty()
+
+                if (!isValidUsername(rawUsername)) {
+                    conn.send(MessageType.LOGIN_ERROR, """{"message":"Usuario inválido (3-16, letras/números/_ )"}""")
+                    continue
+                }
+
+                val username = rawUsername.lowercase()
+
+                if (!ActiveUsers.tryAdd(username)) {
+                    conn.send(MessageType.LOGIN_ERROR, """{"message":"Ese usuario ya está conectado"}""")
+                    continue
+                }
+
+                conn.setUsername(username)
+                conn.send(MessageType.LOGIN_OK, """{"username":"$rawUsername"}""")
+
+                println("Usuarios activos: ${ActiveUsers.snapshot()}") // log útil
+                break
+            }
+
             val records = recordsStore.loadRawJson()
             conn.send(MessageType.RECORDS_SYNC, records)
 
             while (true) {
                 val line = reader.readLine() ?: break
-
                 val env = JsonCodec.decode(line) ?: continue
-                if (env == null) continue
 
                 when (env.type) {
                     MessageType.JOIN_QUEUE -> {
                         conn.send(MessageType.QUEUE_STATUS, """{"status":"WAITING"}""")
-
                         val (a, b) = queue.tryEnqueue(conn)
                         if (a != null && b != null) {
                             a.send(MessageType.QUEUE_STATUS, """{"status":"MATCHED"}""")
@@ -57,22 +84,31 @@ class ClientHandler(
                     else -> conn.send(MessageType.ERROR, """{"message":"Tipo no soportado: ${env.type}"}""")
                 }
             }
+
         } catch (e: Exception) {
-            println("Error cliente (stacktrace):")
-            e.printStackTrace()
+            println("Error cliente: ${e.message}")
         } finally {
+            conn.username?.let { ActiveUsers.remove(it) }
+            println("Usuarios activos: ${ActiveUsers.snapshot()}")
+
             queue.removeIfWaiting(conn)
             conn.close()
             println("Cliente desconectado")
         }
     }
 
+    private fun isValidUsername(u: String): Boolean {
+        if (u.length !in 3..16) return false
+        return u.all { it.isLetterOrDigit() || it == '_' }
+    }
+
+    private fun extractString(json: String, field: String): String? {
+        val regex = """"$field"\s*:\s*"([^"]*)"""".toRegex()
+        return regex.find(json)?.groupValues?.getOrNull(1)
+    }
+
     private fun extractInt(json: String, field: String): Int? {
-        val key = """"$field":"""
-        val idx = json.indexOf(key)
-        if (idx == -1) return null
-        val start = idx + key.length
-        val end = json.indexOfAny(charArrayOf(',', '}', ' '), start).let { if (it == -1) json.length else it }
-        return json.substring(start, end).trim().toIntOrNull()
+        val regex = """"$field"\s*:\s*(\d+)""".toRegex()
+        return regex.find(json)?.groupValues?.getOrNull(1)?.toIntOrNull()
     }
 }

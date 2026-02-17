@@ -9,9 +9,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 object ClientMain {
 
-    private enum class ClientState {
-        MENU, QUEUE, IN_GAME
-    }
+    private enum class ClientState { MENU, QUEUE, IN_GAME }
 
     @JvmStatic
     fun main(args: Array<String>) = runBlocking {
@@ -24,6 +22,42 @@ object ClientMain {
 
         try {
             client.connect()
+
+            var username: String
+
+            while (true) {
+                println("===== LOGIN =====")
+                print("Introduce tu nombre de usuario: ")
+                username = readLine()?.trim().orEmpty()
+
+                client.send(MessageType.LOGIN, """{"username":"$username"}""")
+
+                val line = client.readBlockingLine()
+                val env = JsonCodec.decode(line) ?: continue
+
+                when (env.type) {
+                    MessageType.LOGIN_OK -> {
+                        println("Sesión iniciada como $username")
+                        break
+                    }
+                    MessageType.LOGIN_ERROR -> {
+                        val msg = extractString(env.payloadJson, "message") ?: "Error"
+                        println(" $msg")
+                        println("Inténtalo de nuevo.\n")
+                    }
+                }
+            }
+
+            // ===== RECORDS SYNC =====
+            while (true) {
+                val line = client.readBlockingLine()
+                val env = JsonCodec.decode(line) ?: continue
+                if (env.type == MessageType.RECORDS_SYNC) {
+                    client.setRecordsJson(env.payloadJson)
+                    println("Records sincronizados\n")
+                    break
+                }
+            }
 
             launch(Dispatchers.IO) {
                 client.readLoop { line ->
@@ -54,7 +88,6 @@ object ClientMain {
 
                             val next = extractString(env.payloadJson, "nextPlayer")
                             val mine = mySymbol.get()
-
                             if (mine != null && next == mine) {
                                 val (r, c) = askMove()
                                 client.send(MessageType.MAKE_MOVE, """{"row":$r,"col":$c}""")
@@ -63,13 +96,11 @@ object ClientMain {
 
                         MessageType.ROUND_END -> {
                             val winner = extractString(env.payloadJson, "winner")
-
                             when (winner) {
                                 "DRAW" -> println("\n🤝 Empate.")
                                 "X", "O" -> println("\n🏆 Ganador: $winner")
                                 else -> println("\nFin de ronda.")
                             }
-
                             mySymbol.set(null)
                             lastState.set(null)
                             clientState.set(ClientState.MENU)
@@ -84,13 +115,11 @@ object ClientMain {
             }
 
             while (true) {
-
                 if (clientState.get() != ClientState.MENU) {
                     Thread.sleep(200)
                     continue
                 }
 
-                println()
                 println("===== MENÚ PRINCIPAL =====")
                 println("1. Nueva Partida PVP")
                 println("2. Nueva Partida PVE (pendiente)")
@@ -107,13 +136,14 @@ object ClientMain {
                     "3" -> {
                         println("\n--- RECORDS ---")
                         println(client.recordsJson)
+                        println()
                     }
                     "5" -> {
                         println("Saliendo...")
                         client.close()
                         return@runBlocking
                     }
-                    else -> println("Opción no válida.")
+                    else -> println("Opción no válida.\n")
                 }
             }
 
@@ -130,7 +160,6 @@ object ClientMain {
             val r = readLine()?.trim()?.toIntOrNull()
             print("Col  (0-2): ")
             val c = readLine()?.trim()?.toIntOrNull()
-
             if (r != null && c != null && r in 0..2 && c in 0..2) return r to c
             println("Entrada inválida.")
         }
@@ -175,7 +204,7 @@ object ClientMain {
             .map { it.groupValues[1].trim() }
             .toList()
 
-        val cells = values.take(9).map { it } + List((9 - values.take(9).size).coerceAtLeast(0)) { "" }
+        val cells = values.take(9) + List((9 - values.take(9).size).coerceAtLeast(0)) { "" }
 
         return listOf(
             listOf(cells[0], cells[1], cells[2]),

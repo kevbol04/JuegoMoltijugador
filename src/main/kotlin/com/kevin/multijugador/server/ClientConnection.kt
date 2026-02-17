@@ -11,6 +11,13 @@ class ClientConnection(
 ) {
     private val closed = AtomicBoolean(false)
 
+    var username: String? = null
+        private set
+
+    fun setUsername(name: String) {
+        username = name
+    }
+
     fun send(type: String, payloadJson: String) {
         if (closed.get()) return
         writer.println(JsonCodec.encode(type, payloadJson))
