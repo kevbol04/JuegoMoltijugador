@@ -1,10 +1,10 @@
 {
   "players":{
     "kevin":{
-      "wins":4,
+      "wins":8,
       "losses":0,
       "draws":2,
-      "streak":0,
+      "streak":4,
       "bestStreak":4
     },
     "marc":{
@@ -16,7 +16,7 @@
     },
     "AI":{
       "wins":0,
-      "losses":2,
+      "losses":6,
       "draws":2,
       "streak":0,
       "bestStreak":0

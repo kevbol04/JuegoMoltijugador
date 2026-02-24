@@ -48,7 +48,6 @@ class ClientHandler(
 
                 conn.setUsername(username)
                 conn.send(MessageType.LOGIN_OK, """{"username":"$rawUsername"}""")
-
                 println("Usuarios activos: ${ActiveUsers.snapshot()}")
                 break
             }
@@ -63,18 +62,37 @@ class ClientHandler(
                 when (env.type) {
 
                     MessageType.JOIN_QUEUE -> {
+                        val boardSize = extractInt(env.payloadJson, "boardSize") ?: 3
+                        val rounds = extractInt(env.payloadJson, "rounds") ?: 3
+                        val timeLimit = extractInt(env.payloadJson, "timeLimit") ?: 30
+                        val turbo = extractBoolean(env.payloadJson, "turbo") ?: false
+                        val fixedTimeLimit = if (turbo && timeLimit in 1..9) 10 else timeLimit
+
+                        val entry = MatchmakingQueue.QueueEntry(
+                            client = conn,
+                            config = MatchmakingQueue.GameConfig(
+                                boardSize = boardSize,
+                                rounds = rounds,
+                                timeLimit = fixedTimeLimit,
+                                turbo = turbo
+                            )
+                        )
+
                         conn.send(MessageType.QUEUE_STATUS, """{"status":"WAITING"}""")
-                        val (a, b) = queue.tryEnqueue(conn)
+
+                        val (a, b) = queue.tryEnqueue(entry)
                         if (a != null && b != null) {
-                            a.send(MessageType.QUEUE_STATUS, """{"status":"MATCHED"}""")
-                            b.send(MessageType.QUEUE_STATUS, """{"status":"MATCHED"}""")
-                            gameService.startPvpGame(a, b)
+                            a.client.send(MessageType.QUEUE_STATUS, """{"status":"MATCHED"}""")
+                            b.client.send(MessageType.QUEUE_STATUS, """{"status":"MATCHED"}""")
+                            gameService.startPvpGame(a.client, b.client, a.config)
                         }
                     }
 
                     MessageType.START_PVE -> {
                         val diffStr = extractString(env.payloadJson, "difficulty") ?: "EASY"
-                        gameService.startPveGame(conn, diffStr)
+                        val boardSize = extractInt(env.payloadJson, "boardSize") ?: 3
+                        val rounds = extractInt(env.payloadJson, "rounds") ?: 3
+                        gameService.startPveGame(conn, diffStr, boardSize, rounds)
                     }
 
                     MessageType.MAKE_MOVE -> {
@@ -116,5 +134,10 @@ class ClientHandler(
     private fun extractInt(json: String, field: String): Int? {
         val regex = """"$field"\s*:\s*(\d+)""".toRegex()
         return regex.find(json)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    }
+
+    private fun extractBoolean(json: String, field: String): Boolean? {
+        val regex = """"$field"\s*:\s*(true|false)""".toRegex()
+        return regex.find(json)?.groupValues?.getOrNull(1)?.toBoolean()
     }
 }
