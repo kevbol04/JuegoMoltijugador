@@ -4,6 +4,9 @@ import com.kevin.multijugador.protocol.Difficulty
 import com.kevin.multijugador.protocol.MessageType
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 class ServerGameService(
     private val recordsStore: RecordsStore,
@@ -11,9 +14,14 @@ class ServerGameService(
 ) {
     private val sessionsByClient = ConcurrentHashMap<ClientConnection, GameSession>()
 
+    // Scheduler para timeouts por turno
+    private val scheduler = Executors.newScheduledThreadPool(1)
+    private val timeoutTaskBySessionId = ConcurrentHashMap<String, ScheduledFuture<*>>()
+
     fun startPvpGame(a: ClientConnection, b: ClientConnection, cfg: MatchmakingQueue.GameConfig) {
         val size = cfg.boardSize.coerceIn(3, 5)
         val rounds = cfg.rounds.coerceIn(3, 7).let { if (it % 2 == 0) it + 1 else it }
+        val timeLimit = cfg.timeLimit.coerceAtLeast(0)
 
         val session = GameSession(
             id = UUID.randomUUID().toString(),
@@ -25,6 +33,7 @@ class ServerGameService(
             round = 1,
             xWins = 0,
             oWins = 0,
+            timeLimitSec = timeLimit,
             board = Array(size) { CharArray(size) { ' ' } },
             next = 'X'
         )
@@ -34,12 +43,14 @@ class ServerGameService(
 
         sendGameStart(session)
         broadcastState(session)
+        scheduleTurnTimeout(session)
     }
 
-    fun startPveGame(human: ClientConnection, diffStr: String, boardSize: Int, rounds: Int) {
+    fun startPveGame(human: ClientConnection, diffStr: String, boardSize: Int, rounds: Int, timeLimitSec: Int) {
         val diff = runCatching { Difficulty.valueOf(diffStr.uppercase()) }.getOrElse { Difficulty.EASY }
         val size = boardSize.coerceIn(3, 5)
         val totalRounds = rounds.coerceIn(3, 7).let { if (it % 2 == 0) it + 1 else it }
+        val tl = timeLimitSec.coerceAtLeast(0)
 
         val session = GameSession(
             id = UUID.randomUUID().toString(),
@@ -51,6 +62,7 @@ class ServerGameService(
             round = 1,
             xWins = 0,
             oWins = 0,
+            timeLimitSec = tl,
             board = Array(size) { CharArray(size) { ' ' } },
             next = 'X'
         )
@@ -59,6 +71,7 @@ class ServerGameService(
 
         sendGameStart(session)
         broadcastState(session)
+        scheduleTurnTimeout(session)
     }
 
     fun handleMove(client: ClientConnection, row: Int, col: Int) {
@@ -71,7 +84,7 @@ class ServerGameService(
 
         val symbol = when (session.mode) {
             GameMode.PVP -> if (client == session.playerX) 'X' else 'O'
-            GameMode.PVE -> 'X'
+            GameMode.PVE -> 'X' // humano siempre X
         }
 
         if (symbol != session.next) {
@@ -89,6 +102,9 @@ class ServerGameService(
             return
         }
 
+        // Cancelamos timeout actual porque hizo jugada válida
+        cancelTurnTimeout(session)
+
         session.board[row][col] = symbol
 
         val winner = checkWinnerNxN(session.board)
@@ -103,31 +119,100 @@ class ServerGameService(
             return
         }
 
+        // Cambia turno
         session.next = if (session.next == 'X') 'O' else 'X'
         broadcastState(session)
 
+        // Si es PVE y toca IA, juega inmediatamente
         if (session.mode == GameMode.PVE && session.next == 'O') {
-            val aiMove = chooseAiMoveSafe(session)
-            session.board[aiMove.first][aiMove.second] = 'O'
-
-            val winner2 = checkWinnerNxN(session.board)
-            val draw2 = winner2 == null && isFull(session.board)
-
-            if (winner2 != null) {
-                onRoundFinished(session, winner2)
-                return
-            }
-            if (draw2) {
-                onRoundFinished(session, "DRAW")
-                return
-            }
-
-            session.next = 'X'
-            broadcastState(session)
+            playAiTurn(session)
+            return
         }
+
+        // Programa timeout para el nuevo turno
+        scheduleTurnTimeout(session)
+    }
+
+    private fun playAiTurn(session: GameSession) {
+        // La IA no debería esperar por timeout; juega al instante cuando le toca.
+        val move = chooseAiMoveSafe(session)
+        session.board[move.first][move.second] = 'O'
+
+        val winner = checkWinnerNxN(session.board)
+        val draw = winner == null && isFull(session.board)
+
+        if (winner != null) {
+            onRoundFinished(session, winner)
+            return
+        }
+        if (draw) {
+            onRoundFinished(session, "DRAW")
+            return
+        }
+
+        // Vuelve el turno al humano
+        session.next = 'X'
+        broadcastState(session)
+
+        // Programa timeout para el humano
+        scheduleTurnTimeout(session)
+    }
+
+    /**
+     * Timeout REAL: cuando se acaba el tiempo, cambia el turno AUTOMÁTICAMENTE.
+     * - No enviamos mensajes al cliente (para que no te “moleste”).
+     * - Solo cambiamos el turno y emitimos GAME_STATE.
+     */
+    private fun scheduleTurnTimeout(session: GameSession) {
+        val tl = session.timeLimitSec
+        if (tl <= 0) return
+
+        cancelTurnTimeout(session)
+
+        val sessionId = session.id
+        val expectedTurn = session.next
+
+        val task = scheduler.schedule({
+            // Verificamos que la sesión siga viva
+            val stillSession = findSessionById(sessionId) ?: return@schedule
+
+            // Si el turno ya cambió (porque jugó), no hacemos nada
+            if (stillSession.next != expectedTurn) return@schedule
+
+            // Si PVE y el turno era IA, no debería pasar, pero por seguridad:
+            // (Igualmente, la IA juega inmediata y cambia el turno a X)
+            if (stillSession.mode == GameMode.PVE && expectedTurn == 'O') return@schedule
+
+            // Cambia turno por timeout
+            stillSession.next = if (stillSession.next == 'X') 'O' else 'X'
+            broadcastState(stillSession)
+
+            // Si al cambiar toca IA, que juegue YA
+            if (stillSession.mode == GameMode.PVE && stillSession.next == 'O') {
+                playAiTurn(stillSession)
+                return@schedule
+            }
+
+            // Si es PVP, programa timeout para el nuevo turno
+            scheduleTurnTimeout(stillSession)
+
+        }, tl.toLong(), TimeUnit.SECONDS)
+
+        timeoutTaskBySessionId[session.id] = task
+    }
+
+    private fun cancelTurnTimeout(session: GameSession) {
+        timeoutTaskBySessionId.remove(session.id)?.cancel(false)
+    }
+
+    private fun findSessionById(id: String): GameSession? {
+        // Cualquiera de los clientes mapea a la sesión
+        return sessionsByClient.values.firstOrNull { it.id == id }
     }
 
     private fun onRoundFinished(session: GameSession, roundWinner: String) {
+        cancelTurnTimeout(session)
+
         when (roundWinner) {
             "X" -> session.xWins++
             "O" -> session.oWins++
@@ -145,11 +230,7 @@ class ServerGameService(
                 session.oWins > session.xWins -> "O"
                 else -> "DRAW"
             }
-        } else {
-            ""
-        }
-
-        broadcastState(session, nextPlayerOverride = "")
+        } else ""
 
         broadcastRoundEnd(session, roundWinner, seriesOver, finalWinner)
 
@@ -160,12 +241,14 @@ class ServerGameService(
             return
         }
 
+        // Siguiente ronda
         session.round++
         session.board = Array(session.board.size) { CharArray(session.board.size) { ' ' } }
         session.next = 'X'
 
         sendGameStart(session)
         broadcastState(session)
+        scheduleTurnTimeout(session)
     }
 
     private fun sendGameStart(session: GameSession) {
@@ -183,7 +266,7 @@ class ServerGameService(
         }
     }
 
-    private fun broadcastState(session: GameSession, nextPlayerOverride: String? = null) {
+    private fun broadcastState(session: GameSession) {
         val size = session.board.size
 
         val boardJson = session.board.joinToString(prefix = "[", postfix = "]") { row ->
@@ -192,8 +275,7 @@ class ServerGameService(
             }
         }
 
-        val next = nextPlayerOverride ?: session.next.toString()
-        val payload = """{"gameId":"${session.id}","boardSize":$size,"board":$boardJson,"nextPlayer":"$next"}"""
+        val payload = """{"gameId":"${session.id}","boardSize":$size,"board":$boardJson,"nextPlayer":"${session.next}"}"""
 
         session.playerX.send(MessageType.GAME_STATE, payload)
         session.playerO?.send(MessageType.GAME_STATE, payload)
@@ -271,6 +353,7 @@ class ServerGameService(
     }
 
     private fun endSession(session: GameSession) {
+        cancelTurnTimeout(session)
         sessionsByClient.remove(session.playerX)
         session.playerO?.let { sessionsByClient.remove(it) }
     }
@@ -280,7 +363,6 @@ class ServerGameService(
         val diff = session.difficulty ?: Difficulty.EASY
 
         if (size == 3) return aiService.chooseMove(session.board, diff)
-
         return availableMoves(session.board).random()
     }
 
@@ -289,11 +371,7 @@ class ServerGameService(
 
     private fun availableMoves(board: Array<CharArray>): List<Pair<Int, Int>> =
         buildList {
-            for (r in board.indices) {
-                for (c in board.indices) {
-                    if (board[r][c] == ' ') add(r to c)
-                }
-            }
+            for (r in board.indices) for (c in board.indices) if (board[r][c] == ' ') add(r to c)
         }
 
     private fun checkWinnerNxN(b: Array<CharArray>): String? {

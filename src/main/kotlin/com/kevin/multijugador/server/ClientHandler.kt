@@ -92,7 +92,11 @@ class ClientHandler(
                         val diffStr = extractString(env.payloadJson, "difficulty") ?: "EASY"
                         val boardSize = extractInt(env.payloadJson, "boardSize") ?: 3
                         val rounds = extractInt(env.payloadJson, "rounds") ?: 3
-                        gameService.startPveGame(conn, diffStr, boardSize, rounds)
+                        val timeLimit = extractInt(env.payloadJson, "timeLimit") ?: 30
+                        val turbo = extractBoolean(env.payloadJson, "turbo") ?: false
+                        val fixedTimeLimit = if (turbo && timeLimit in 1..9) 10 else timeLimit
+
+                        gameService.startPveGame(conn, diffStr, boardSize, rounds, fixedTimeLimit)
                     }
 
                     MessageType.MAKE_MOVE -> {
@@ -115,7 +119,7 @@ class ClientHandler(
             conn.username?.let { ActiveUsers.remove(it) }
             println("Usuarios activos: ${ActiveUsers.snapshot()}")
 
-            queue.removeIfWaiting(conn)
+            queue.removeIfWaiting(conn) // si tu queue usa QueueEntry, ajusta esto a removeIfWaiting(entry)
             conn.close()
             println("Cliente desconectado")
         }

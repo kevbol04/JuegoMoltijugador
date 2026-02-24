@@ -5,6 +5,7 @@ import com.kevin.multijugador.protocol.MessageType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicReference
 
 object ClientMain {
@@ -19,6 +20,8 @@ object ClientMain {
         var turbo: Boolean = false
     )
 
+    private enum class InputStep { NONE, WAIT_ROW, WAIT_COL }
+
     @JvmStatic
     fun main(args: Array<String>) = runBlocking {
         val cfg = ClientConfigLoader.load()
@@ -30,15 +33,31 @@ object ClientMain {
         val usernameRef = AtomicReference<String?>(null)
         val configRef = AtomicReference(GameConfig())
 
+        val inputLines = LinkedBlockingQueue<String>()
+
+        val inputStep = AtomicReference(InputStep.NONE)
+        val pendingRow = AtomicReference<Int?>(null)
+
+        // ✅ mensaje de timeout diferido (se imprime tras el próximo ENTER del usuario)
+        val deferredTimeoutMsg = AtomicReference<String?>(null)
+
         try {
             client.connect()
 
-            var username: String
+            // ÚNICO lector de teclado
+            launch(Dispatchers.IO) {
+                while (true) {
+                    val line = readLine() ?: break
+                    inputLines.offer(line.trim())
+                }
+            }
 
+            // LOGIN
+            var username: String
             while (true) {
                 println("===== LOGIN =====")
                 print("Introduce tu nombre de usuario: ")
-                username = readLine()?.trim().orEmpty()
+                username = takeLineBlocking(inputLines, clientState, deferredTimeoutMsg)
 
                 client.send(MessageType.LOGIN, """{"username":"$username"}""")
 
@@ -51,7 +70,6 @@ object ClientMain {
                         usernameRef.set(username.lowercase())
                         break
                     }
-
                     MessageType.LOGIN_ERROR -> {
                         val msg = extractString(env.payloadJson, "message") ?: "Error"
                         println(" $msg")
@@ -60,6 +78,7 @@ object ClientMain {
                 }
             }
 
+            // RECORDS
             while (true) {
                 val line = client.readBlockingLine()
                 val env = JsonCodec.decode(line) ?: continue
@@ -70,6 +89,7 @@ object ClientMain {
                 }
             }
 
+            // HILO RED
             launch(Dispatchers.IO) {
                 client.readLoop { line ->
                     val env = JsonCodec.decode(line) ?: return@readLoop
@@ -107,6 +127,11 @@ object ClientMain {
                             }
 
                             println("Tu símbolo: $sym")
+                            inputStep.set(InputStep.NONE)
+                            pendingRow.set(null)
+
+                            // si quedaba un timeout viejo, lo limpiamos al empezar ronda
+                            deferredTimeoutMsg.set(null)
                         }
 
                         MessageType.GAME_STATE -> {
@@ -117,10 +142,28 @@ object ClientMain {
 
                             val next = extractString(env.payloadJson, "nextPlayer")
                             val mine = mySymbol.get()
-                            if (mine != null && next == mine) {
-                                val (r, c) = askMove(size)
-                                client.send(MessageType.MAKE_MOVE, """{"row":$r,"col":$c}""")
+
+                            // Si NO es mi turno: cancelo entrada fila/col
+                            if (mine == null || next != mine) {
+                                inputStep.set(InputStep.NONE)
+                                pendingRow.set(null)
+                                return@readLoop
                             }
+
+                            // Es mi turno: pedir movimiento clásico (fila ENTER, col ENTER)
+                            val (r, c) = askMoveClassic(size, inputLines, clientState, deferredTimeoutMsg)
+                            client.send(MessageType.MAKE_MOVE, """{"row":$r,"col":$c}""")
+                        }
+
+                        // ✅ TIMEOUT: NO imprimimos ahora. Guardamos y se mostrará al siguiente ENTER.
+                        MessageType.TIMEOUT -> {
+                            val who = extractString(env.payloadJson, "timedOut") ?: ""
+                            val base = extractString(env.payloadJson, "message") ?: "Tiempo agotado. Pierdes el turno."
+                            val msg = if (who.isNotBlank()) "⏰ $base (jugador: $who)" else "⏰ $base"
+                            deferredTimeoutMsg.set(msg)
+
+                            inputStep.set(InputStep.NONE)
+                            pendingRow.set(null)
                         }
 
                         MessageType.ROUND_END -> {
@@ -141,6 +184,9 @@ object ClientMain {
                             }
                             println("Marcador -> X:$xWins | O:$oWins | (necesitas $needed)")
 
+                            inputStep.set(InputStep.NONE)
+                            pendingRow.set(null)
+
                             if (seriesOver) {
                                 val winner = extractString(env.payloadJson, "winner") ?: "DRAW"
                                 val winnerUser = extractString(env.payloadJson, "winnerUser")
@@ -148,46 +194,28 @@ object ClientMain {
 
                                 when (winner) {
                                     "DRAW" -> println("\n🏁 SERIE FINALIZADA: EMPATE.")
-                                    "X", "O" -> {
-                                        println("\n🏆 SERIE FINALIZADA. Ganador: $winner ${winnerUser?.let { "($it)" } ?: ""}")
-                                        if (winnerUser != null && loserUser != null) {
-                                            println("Resultado final: $winnerUser vs $loserUser")
-                                        }
-                                    }
+                                    "X", "O" -> println("\n🏆 SERIE FINALIZADA. Ganador: $winner ${winnerUser?.let { "($it)" } ?: ""}")
                                     else -> println("\n🏁 SERIE FINALIZADA.")
                                 }
 
                                 mySymbol.set(null)
                                 lastState.set(null)
                                 clientState.set(ClientState.MENU)
-                            } else {
-                                clientState.set(ClientState.IN_GAME)
+                                deferredTimeoutMsg.set(null)
                             }
                         }
 
                         MessageType.ERROR -> {
                             val msg = extractString(env.payloadJson, "message") ?: "Error desconocido"
                             println("\nERROR: $msg")
-
-                            val mine = mySymbol.get()
-                            val stateJson = lastState.get()
-                            val next = if (stateJson != null) extractString(stateJson, "nextPlayer") else null
-                            val size = if (stateJson != null) extractInt(stateJson, "boardSize") ?: 3 else 3
-
-                            if (clientState.get() == ClientState.IN_GAME && mine != null && next == mine) {
-                                println("Repite la tirada.")
-                                val (r, c) = askMove(size)
-                                client.send(MessageType.MAKE_MOVE, """{"row":$r,"col":$c}""")
-                            }
                         }
 
-                        MessageType.RECORDS_SYNC -> {
-                            client.setRecordsJson(env.payloadJson)
-                        }
+                        MessageType.RECORDS_SYNC -> client.setRecordsJson(env.payloadJson)
                     }
                 }
             }
 
+            // MENÚ
             while (true) {
                 if (clientState.get() != ClientState.MENU) {
                     Thread.sleep(200)
@@ -205,7 +233,9 @@ object ClientMain {
                 println("Config actual: tablero ${cfgLocal.boardSize}x${cfgLocal.boardSize}, mejor de ${cfgLocal.rounds}, IA ${cfgLocal.difficulty}, timeLimit ${cfgLocal.timeLimit}, turbo ${cfgLocal.turbo}")
                 print("Elige opción: ")
 
-                when (readLine()?.trim()) {
+                val opt = takeLineBlocking(inputLines, clientState, deferredTimeoutMsg)
+
+                when (opt) {
                     "1" -> {
                         val cfgSend = configRef.get()
                         client.send(
@@ -230,15 +260,10 @@ object ClientMain {
                         println()
                     }
 
-                    "4" -> {
-                        configMenu(configRef)
-                    }
+                    "4" -> configMenu(configRef, inputLines, clientState, deferredTimeoutMsg)
 
                     "5" -> {
                         println("Saliendo...")
-                        mySymbol.set(null)
-                        lastState.set(null)
-                        clientState.set(ClientState.MENU)
                         client.close()
                         return@runBlocking
                     }
@@ -254,20 +279,48 @@ object ClientMain {
         }
     }
 
-    private fun askMove(size: Int): Pair<Int, Int> {
+    // ✅ Lee una línea de la cola. Si había TIMEOUT pendiente, lo imprime JUSTO después del ENTER.
+    private fun takeLineBlocking(
+        q: LinkedBlockingQueue<String>,
+        clientState: AtomicReference<ClientState>,
+        deferredTimeoutMsg: AtomicReference<String?>
+    ): String {
+        while (true) {
+            val v = q.take()
+
+            // imprime timeout diferido SOLO en partida (no en menú/login)
+            val pending = deferredTimeoutMsg.getAndSet(null)
+            if (pending != null && clientState.get() == ClientState.IN_GAME) {
+                println("\n$pending\n")
+            }
+
+            val s = v.trim()
+            if (s.isNotBlank()) return s
+        }
+    }
+
+    // ✅ formato clásico: primero fila, luego col (cada uno en una línea)
+    private fun askMoveClassic(
+        size: Int,
+        inputLines: LinkedBlockingQueue<String>,
+        clientState: AtomicReference<ClientState>,
+        deferredTimeoutMsg: AtomicReference<String?>
+    ): Pair<Int, Int> {
         val max = size - 1
+
         while (true) {
             print("Fila (0-$max): ")
-            val r = readLine()?.trim()?.toIntOrNull()
+            val r = takeLineBlocking(inputLines, clientState, deferredTimeoutMsg).toIntOrNull()
+
             print("Col  (0-$max): ")
-            val c = readLine()?.trim()?.toIntOrNull()
+            val c = takeLineBlocking(inputLines, clientState, deferredTimeoutMsg).toIntOrNull()
 
             if (r == null || c == null) {
-                println("Debes escribir números.")
+                println("Movimiento inválido: debes escribir números.")
                 continue
             }
             if (r !in 0..max || c !in 0..max) {
-                println("Fuera de rango. Debe ser entre 0 y $max.")
+                println("Movimiento fuera de rango (0..$max).")
                 continue
             }
             return r to c
@@ -279,25 +332,12 @@ object ClientMain {
         val next = extractString(payload, "nextPlayer")
 
         println()
-        print("   ")
-        for (c in 0 until size) print("$c   ")
-        println()
-
+        println("   " + (0 until size).joinToString("   "))
         for (r in 0 until size) {
-            print("$r  ")
-            for (c in 0 until size) {
-                val v = board[r][c].ifBlank { " " }
-                print(v)
-                if (c != size - 1) print(" | ")
-            }
-            println()
+            val row = (0 until size).joinToString(" | ") { c -> board[r][c].ifBlank { " " } }
+            println("$r  $row")
             if (r != size - 1) {
-                print("   ")
-                for (c in 0 until size) {
-                    print("---")
-                    if (c != size - 1) print("+")
-                }
-                println()
+                println("   " + (0 until size).joinToString("+") { "---" })
             }
         }
         println("Turno: $next")
@@ -323,9 +363,7 @@ object ClientMain {
         var idx = 0
         for (r in 0 until size) {
             val row = mutableListOf<String>()
-            for (c in 0 until size) {
-                row.add(cells[idx++])
-            }
+            for (c in 0 until size) row.add(cells[idx++])
             grid.add(row)
         }
         return grid
@@ -382,7 +420,13 @@ object ClientMain {
         return regex.find(json)?.groupValues?.getOrNull(1)?.toIntOrNull()
     }
 
-    private fun configMenu(configRef: AtomicReference<GameConfig>) {
+    // Config (igual que lo tenías)
+    private fun configMenu(
+        configRef: AtomicReference<GameConfig>,
+        inputLines: LinkedBlockingQueue<String>,
+        clientState: AtomicReference<ClientState>,
+        deferredTimeoutMsg: AtomicReference<String?>
+    ) {
         while (true) {
             val cfg = configRef.get()
             println("\n===== CONFIGURACIÓN =====")
@@ -394,11 +438,11 @@ object ClientMain {
             println("6. Volver al menú")
             print("Elige opción: ")
 
-            when (readLine()?.trim()) {
-                "1" -> cfg.boardSize = askBoardSize()
-                "2" -> cfg.rounds = askRounds()
-                "3" -> cfg.difficulty = askDifficulty()
-                "4" -> cfg.timeLimit = askTimeLimit(cfg.turbo)
+            when (takeLineBlocking(inputLines, clientState, deferredTimeoutMsg)) {
+                "1" -> cfg.boardSize = askBoardSize(inputLines, clientState, deferredTimeoutMsg)
+                "2" -> cfg.rounds = askRounds(inputLines, clientState, deferredTimeoutMsg)
+                "3" -> cfg.difficulty = askDifficulty(inputLines, clientState, deferredTimeoutMsg)
+                "4" -> cfg.timeLimit = askTimeLimit(cfg.turbo, inputLines, clientState, deferredTimeoutMsg)
                 "5" -> {
                     cfg.turbo = !cfg.turbo
                     if (cfg.turbo && cfg.timeLimit in 1..9) cfg.timeLimit = 10
@@ -414,14 +458,18 @@ object ClientMain {
         }
     }
 
-    private fun askBoardSize(): Int {
+    private fun askBoardSize(
+        inputLines: LinkedBlockingQueue<String>,
+        clientState: AtomicReference<ClientState>,
+        deferredTimeoutMsg: AtomicReference<String?>
+    ): Int {
         while (true) {
             println("\nTamaño tablero:")
             println("1. 3x3")
             println("2. 4x4")
             println("3. 5x5")
             print("Elige: ")
-            return when (readLine()?.trim()) {
+            return when (takeLineBlocking(inputLines, clientState, deferredTimeoutMsg)) {
                 "1" -> 3
                 "2" -> 4
                 "3" -> 5
@@ -433,14 +481,18 @@ object ClientMain {
         }
     }
 
-    private fun askRounds(): Int {
+    private fun askRounds(
+        inputLines: LinkedBlockingQueue<String>,
+        clientState: AtomicReference<ClientState>,
+        deferredTimeoutMsg: AtomicReference<String?>
+    ): Int {
         while (true) {
             println("\nMejor de:")
             println("1. 3")
             println("2. 5")
             println("3. 7")
             print("Elige: ")
-            return when (readLine()?.trim()) {
+            return when (takeLineBlocking(inputLines, clientState, deferredTimeoutMsg)) {
                 "1" -> 3
                 "2" -> 5
                 "3" -> 7
@@ -452,14 +504,18 @@ object ClientMain {
         }
     }
 
-    private fun askDifficulty(): String {
+    private fun askDifficulty(
+        inputLines: LinkedBlockingQueue<String>,
+        clientState: AtomicReference<ClientState>,
+        deferredTimeoutMsg: AtomicReference<String?>
+    ): String {
         while (true) {
             println("\nDificultad IA:")
             println("1. EASY")
             println("2. MEDIUM")
             println("3. HARD")
             print("Elige: ")
-            return when (readLine()?.trim()) {
+            return when (takeLineBlocking(inputLines, clientState, deferredTimeoutMsg)) {
                 "1" -> "EASY"
                 "2" -> "MEDIUM"
                 "3" -> "HARD"
@@ -471,10 +527,15 @@ object ClientMain {
         }
     }
 
-    private fun askTimeLimit(turbo: Boolean): Int {
+    private fun askTimeLimit(
+        turbo: Boolean,
+        inputLines: LinkedBlockingQueue<String>,
+        clientState: AtomicReference<ClientState>,
+        deferredTimeoutMsg: AtomicReference<String?>
+    ): Int {
         while (true) {
             print("\nTiempo por movimiento en segundos (0 = sin límite): ")
-            val v = readLine()?.trim()?.toIntOrNull()
+            val v = takeLineBlocking(inputLines, clientState, deferredTimeoutMsg).toIntOrNull()
             if (v == null || v < 0) {
                 println("Valor inválido.")
                 continue
